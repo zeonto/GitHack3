@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding:utf-8
 
 """
@@ -97,11 +97,21 @@ def clone_from_cache():
     readorwget("FETCH_HEAD")
     readorwget("refs/heads/master")
     readorwget("refs/remote/master")
-    refs = readorwget("HEAD")[5:-1]
+    # 使用text_mode=True直接获取字符串
+    head_content = readorwget("HEAD", text_mode=True)
+    if head_content:
+        refs = head_content[5:-1].strip()
+    else:
+        refs = None
     readorwget("index")
     readorwget("logs/HEAD", True)
-    HEAD_HASH = readorwget(refs)
-    readorwget("logs/refs/heads/%s" % (refs.split("/")[-1]))
+    # 对于需要字符串处理的文件，使用text_mode=True
+    HEAD_HASH = readorwget(refs, text_mode=True) if refs else None
+    if refs:
+        try:
+            readorwget("logs/refs/heads/%s" % (refs.split("/")[-1]))
+        except Exception:
+            logger.warning("Failed to read logs for %s" % refs)
     
     if HEAD_HASH:
         cache_commits(HEAD_HASH.replace("\n", ""))
@@ -109,14 +119,17 @@ def clone_from_cache():
     readorwget("logs/refs/remote/master")
     readorwget("logs/refs/stash")
     # 下载 stash
-    STASH_HASH = readorwget("refs/stash")
+    STASH_HASH = readorwget("refs/stash", text_mode=True)
     if STASH_HASH:
         cache_commits(STASH_HASH.replace("\n", ""))
 
     cache_objects()
 
 
-def readorwget(filename, refresh=False):
+def readorwget(filename, refresh=False, text_mode=False):
+    # 确保filename是字符串类型
+    if isinstance(filename, bytes):
+        filename = filename.decode('utf-8', errors='replace')
     filepath = os.path.join(paths.GITHACK_DIST_TARGET_GIT_PATH, filename)
     if refresh or not os.path.exists(filepath):
         logger.info(filename)
@@ -126,7 +139,7 @@ def readorwget(filename, refresh=False):
             logger.info("[Skip] File %s already exists. " % filename)
     if not os.path.exists(filepath):
         return None
-    return readFile(filepath)
+    return readFile(filepath, text_mode)
 
 
 def parse_refs(data):
@@ -153,7 +166,7 @@ def parse_refs(data):
         fetch = +refs/heads/*:refs/remotes/origin/*
     """ % (target.TARGET_GIT_URL[:-1])
         writeFile(os.path.join(paths.GITHACK_DIST_TARGET_GIT_PATH, "config"), config)
-    except:
+    except Exception:
         logger.warning("Parse refs Fail")
 
 
@@ -182,7 +195,7 @@ def cache_commits(starthash):
                 if objdata[:4] == 'tree':
                     trees = parse_tree(objdata[objdata.find('\x00') + 1:])
                     tmp.extend(trees)
-            except:
+            except Exception:
                 pass
             (obj, parents) = parse_commit(data, i)
             if parents:
@@ -192,10 +205,10 @@ def cache_commits(starthash):
             data = get_objects(obj)
             try:
                 objdata = zlib.decompress(data)
-                if objdata[:4] == 'tree':
-                    trees = parse_tree(objdata[objdata.find('\x00') + 1:])
+                if objdata[:4] == b'tree':
+                    trees = parse_tree(objdata[objdata.find(b'\x00') + 1:])
                     tmp.extend(trees)
-            except:
+            except Exception:
                 pass
         indexhash = tmp
     logger.info("Fetch Commit Objects End")
@@ -245,7 +258,7 @@ def parse_commit(data, commithash):
         if m:
             obj = m.group(1)
         parents = re.findall('parent ([a-z0-9]{40})\n', de_data, re.M | re.S | re.I)
-    except:
+    except Exception:
         parents = []
         if DEBUG:
             logger.warning("Decompress Commit(%s) Fail" % commithash)
@@ -279,7 +292,7 @@ def cache_objects():
                     #     objs = parse_tree(data[11:])
                     #     for obj in objs:
                     #         cache_commits(obj)
-            except:
+            except Exception:
                 logger.warning("Clone Objects(%s) Fail" % (entry["sha1"]))
 
 
@@ -295,8 +308,8 @@ def parse_index(filename, pretty=True):
             # "All binary numbers are in network byte order."
             # Hence "!" = network order, big endian
             format = "! " + format
-            bytes = f.read(struct.calcsize(format))
-            return struct.unpack(format, bytes)[0]
+            bytes_data = f.read(struct.calcsize(format))
+            return struct.unpack(format, bytes_data)[0]
 
         index = collections.OrderedDict()
 
@@ -384,7 +397,7 @@ def parse_index(filename, pretty=True):
                 name = []
                 while True:
                     byte = f.read(1)
-                    if byte == "\x00":
+                    if byte == b"\x00":  # 使用bytes类型进行比较
                         break
                     name.append(byte)
                 entry["name"] = b"".join(name).decode("utf-8", "replace")

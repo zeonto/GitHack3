@@ -1,4 +1,6 @@
-# GitHack
+# GitHack3
+
+**Python 3 版本**
 
 > `.git` 泄漏利用工具，可还原历史版本
 
