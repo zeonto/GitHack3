@@ -16,6 +16,7 @@ from lib.git import clone_from_list
 from lib.git import clone_from_cache
 from lib.git import init
 from lib.git import refresh_files
+from lib.git import fix_git_repo
 
 def start():
     if method_a() or method_b() or method_c():
@@ -56,6 +57,7 @@ def method_c():
     clone_from_cache()
     if not valid_git_repo():
         logger.warning("Clone With Cache end. But missed some files.")
+        fix_git_repo()
     return True
 
 def job_success():

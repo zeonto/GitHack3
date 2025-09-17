@@ -62,6 +62,36 @@ def valid_git_repo():
     logger.success("Valid Repository Success")
     return True
 
+def fix_pack_refs():
+    logger.info("  * Fix pack-refs")
+    # 如果 packed-refs 文件存在，改名为 packed-refs.bak
+    packed_refs_path = os.path.join(paths.GITHACK_DIST_TARGET_GIT_PATH, "packed-refs")
+    if os.path.exists(packed_refs_path):
+        logger.info("  * packed-refs exists, rename to packed-refs.bak")
+        os.rename(packed_refs_path, packed_refs_path + ".bak")
+    # 重新生成 packed-refs
+    process = subprocess.Popen(
+        "cd %s && git pack-refs --all" % (paths.GITHACK_DIST_TARGET_PATH),
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    if stderr:
+        logger.error("  Fix pack-refs Error: %s" % (stderr))
+        return False
+    logger.success("  * Fix pack-refs Success")
+    return True
+
+def fix_git_repo():
+    logger.info("Fix Git Repository...")
+    process = subprocess.Popen(
+        "cd %s && git fsck --full" % (paths.GITHACK_DIST_TARGET_PATH),
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    if stderr:
+        logger.error("  Found Error: %s" % (stderr))
+        if b"packed-refs" in stderr:
+            fix_pack_refs()
+    logger.info("Fix Git Repository End!")
+    return True
 
 def clone_from_list(name):
     if name[0] == "/":
@@ -189,11 +219,14 @@ def cache_commits(starthash):
         for i in indexhash:
             if DEBUG:
                 logger.info("Fetch Commit Objects: %s" % i)
+            if not i.isalnum():
+                logger.warning("   --- continue, hash: %s" % i[:200])
+                continue
             data = get_objects(i)
             try:
                 objdata = zlib.decompress(data)
-                if objdata[:4] == 'tree':
-                    trees = parse_tree(objdata[objdata.find('\x00') + 1:])
+                if objdata[:4] == b'tree':
+                    trees = parse_tree(objdata[objdata.find(b'\x00') + 1:])
                     tmp.extend(trees)
             except Exception:
                 pass
@@ -238,13 +271,17 @@ def parse_tree(text, strict=False):
             break
         hexsha = sha_to_hex(sha)
         # print (name, mode, hexsha)
-        retVal.append(hexsha)
+        retVal.append(hexsha.decode('utf-8'))
     return retVal
 
 
 def sha_to_hex(sha):
     """Takes a string and returns the hex of the sha within"""
-    hexsha = binascii.hexlify(sha)
+    try:
+        hexsha = binascii.hexlify(sha)
+    except Exception as e:
+        logger.error(f"计算SHA1哈希值失败: {e}")
+        return None
     assert len(hexsha) == 40, "Incorrect length of sha1 string: %d" % hexsha
     return hexsha
 
@@ -253,15 +290,17 @@ def parse_commit(data, commithash):
     obj = None
     try:
         de_data = zlib.decompress(data)
+        # 将字节对象转换为字符串再进行正则匹配
+        de_data_str = de_data.decode('utf-8', errors='replace')
         m = re.search(
-            'commit \d+?\x00tree ([a-z0-9]{40})\n', de_data, re.M | re.S | re.I)
+            'commit \d+?\x00tree ([a-z0-9]{40})\n', de_data_str, re.M | re.S | re.I)
         if m:
             obj = m.group(1)
-        parents = re.findall('parent ([a-z0-9]{40})\n', de_data, re.M | re.S | re.I)
-    except Exception:
+        parents = re.findall('parent ([a-z0-9]{40})\n', de_data_str, re.M | re.S | re.I)
+    except Exception as e:
         parents = []
         if DEBUG:
-            logger.warning("Decompress Commit(%s) Fail" % commithash)
+            logger.warning("Decompress Commit(%s) Fail: %s" % (commithash, e))
     return (obj, parents)
 
 
@@ -281,7 +320,7 @@ def cache_objects():
                 data = get_objects(entry["sha1"])
                 if data:
                     data = zlib.decompress(data)
-                    data = re.sub('blob \d+\00', '', data)
+                    data = re.sub(b'blob \d+\00', b'', data)
                     target_dir = os.path.join(paths.GITHACK_DIST_TARGET_PATH, os.path.dirname(entry["name"]))
                     if target_dir and not os.path.exists(target_dir):
                         os.makedirs(target_dir)
@@ -292,121 +331,120 @@ def cache_objects():
                     #     objs = parse_tree(data[11:])
                     #     for obj in objs:
                     #         cache_commits(obj)
-            except Exception:
-                logger.warning("Clone Objects(%s) Fail" % (entry["sha1"]))
+            except Exception as e:
+                logger.warning(f"Clone Objects({entry['sha1']}) Fail: {e}")
 
 
 def parse_index(filename, pretty=True):
     """
-        解析 index 文件
-        https://github.com/git/git/blob/master/Documentation/technical/index-format.txt
+    解析 index 文件
+    https://github.com/git/git/blob/master/Documentation/technical/index-format.txt
     """
     with open(filename, "rb") as o:
-        f = mmap.mmap(o.fileno(), 0, access=mmap.ACCESS_READ)
+        with mmap.mmap(o.fileno(), 0, access=mmap.ACCESS_READ) as f:
+            def read(format_str):
+                # "All binary numbers are in network byte order."
+                # Hence "!" = network order, big endian
+                format_str = "! " + format_str
+                bytes_data = f.read(struct.calcsize(format_str))
+                return struct.unpack(format_str, bytes_data)[0]
 
-        def read(format):
-            # "All binary numbers are in network byte order."
-            # Hence "!" = network order, big endian
-            format = "! " + format
-            bytes_data = f.read(struct.calcsize(format))
-            return struct.unpack(format, bytes_data)[0]
+            index = collections.OrderedDict()
 
-        index = collections.OrderedDict()
+            # 4-byte signature, b"DIRC"
+            index["signature"] = f.read(4).decode("ascii")
+            check(index["signature"] == "DIRC", "Not a Git index file")
 
-        # 4-byte signature, b"DIRC"
-        index["signature"] = f.read(4).decode("ascii")
-        check(index["signature"] == "DIRC", "Not a Git index file")
+            # 4-byte version number
+            index["version"] = read("I")
+            check(index["version"] in {2, 3}, "Unsupported version: %s" % index["version"])
 
-        # 4-byte version number
-        index["version"] = read("I")
-        check(index["version"] in {2, 3}, "Unsupported version: %s" % index["version"])
+            # 32-bit number of index entries, i.e. 4-byte
+            index["entries"] = read("I")
 
-        # 32-bit number of index entries, i.e. 4-byte
-        index["entries"] = read("I")
+            yield index
 
-        yield index
+            for n in range(index["entries"]):
+                entry = collections.OrderedDict()
 
-        for n in range(index["entries"]):
-            entry = collections.OrderedDict()
+                entry["entry"] = n + 1
 
-            entry["entry"] = n + 1
+                entry["ctime_seconds"] = read("I")
+                entry["ctime_nanoseconds"] = read("I")
+                if pretty:
+                    entry["ctime"] = entry["ctime_seconds"]
+                    entry["ctime"] += entry["ctime_nanoseconds"] / 1000000000
+                    del entry["ctime_seconds"]
+                    del entry["ctime_nanoseconds"]
 
-            entry["ctime_seconds"] = read("I")
-            entry["ctime_nanoseconds"] = read("I")
-            if pretty:
-                entry["ctime"] = entry["ctime_seconds"]
-                entry["ctime"] += entry["ctime_nanoseconds"] / 1000000000
-                del entry["ctime_seconds"]
-                del entry["ctime_nanoseconds"]
+                entry["mtime_seconds"] = read("I")
+                entry["mtime_nanoseconds"] = read("I")
+                if pretty:
+                    entry["mtime"] = entry["mtime_seconds"]
+                    entry["mtime"] += entry["mtime_nanoseconds"] / 1000000000
+                    del entry["mtime_seconds"]
+                    del entry["mtime_nanoseconds"]
 
-            entry["mtime_seconds"] = read("I")
-            entry["mtime_nanoseconds"] = read("I")
-            if pretty:
-                entry["mtime"] = entry["mtime_seconds"]
-                entry["mtime"] += entry["mtime_nanoseconds"] / 1000000000
-                del entry["mtime_seconds"]
-                del entry["mtime_nanoseconds"]
+                entry["dev"] = read("I")
+                entry["ino"] = read("I")
 
-            entry["dev"] = read("I")
-            entry["ino"] = read("I")
+                # 4-bit object type, 3-bit unused, 9-bit unix permission
+                entry["mode"] = read("I")
+                if pretty:
+                    entry["mode"] = "%06o" % entry["mode"]
 
-            # 4-bit object type, 3-bit unused, 9-bit unix permission
-            entry["mode"] = read("I")
-            if pretty:
-                entry["mode"] = "%06o" % entry["mode"]
+                entry["uid"] = read("I")
+                entry["gid"] = read("I")
+                entry["size"] = read("I")
 
-            entry["uid"] = read("I")
-            entry["gid"] = read("I")
-            entry["size"] = read("I")
+                entry["sha1"] = binascii.hexlify(f.read(20)).decode("ascii")
+                entry["flags"] = read("H")
 
-            entry["sha1"] = binascii.hexlify(f.read(20)).decode("ascii")
-            entry["flags"] = read("H")
+                # 1-bit assume-valid
+                entry["assume-valid"] = bool(entry["flags"] & (0b10000000 << 8))
+                # 1-bit extended, must be 0 in version 2
+                entry["extended"] = bool(entry["flags"] & (0b01000000 << 8))
+                # 2-bit stage (?)
+                stage_one = bool(entry["flags"] & (0b00100000 << 8))
+                stage_two = bool(entry["flags"] & (0b00010000 << 8))
+                entry["stage"] = (stage_one, stage_two)
+                # 12-bit name length, if the length is less than 0xFFF (else, 0xFFF)
+                namelen = entry["flags"] & 0xFFF
 
-            # 1-bit assume-valid
-            entry["assume-valid"] = bool(entry["flags"] & (0b10000000 << 8))
-            # 1-bit extended, must be 0 in version 2
-            entry["extended"] = bool(entry["flags"] & (0b01000000 << 8))
-            # 2-bit stage (?)
-            stage_one = bool(entry["flags"] & (0b00100000 << 8))
-            stage_two = bool(entry["flags"] & (0b00010000 << 8))
-            entry["stage"] = stage_one, stage_two
-            # 12-bit name length, if the length is less than 0xFFF (else, 0xFFF)
-            namelen = entry["flags"] & 0xFFF
+                # 62 bytes so far
+                entrylen = 62
 
-            # 62 bytes so far
-            entrylen = 62
+                if entry["extended"] and (index["version"] == 3):
+                    entry["extra-flags"] = read("H")
+                    # 1-bit reserved
+                    entry["reserved"] = bool(entry["extra-flags"] & (0b10000000 << 8))
+                    # 1-bit skip-worktree
+                    entry["skip-worktree"] = bool(entry["extra-flags"] & (0b01000000 << 8))
+                    # 1-bit intent-to-add
+                    entry["intent-to-add"] = bool(entry["extra-flags"] & (0b00100000 << 8))
+                    # 13-bits unused
+                    # used = entry["extra-flags"] & (0b11100000 << 8)
+                    # check(not used, "Expected unused bits in extra-flags")
+                    entrylen += 2
 
-            if entry["extended"] and (index["version"] == 3):
-                entry["extra-flags"] = read("H")
-                # 1-bit reserved
-                entry["reserved"] = bool(entry["extra-flags"] & (0b10000000 << 8))
-                # 1-bit skip-worktree
-                entry["skip-worktree"] = bool(entry["extra-flags"] & (0b01000000 << 8))
-                # 1-bit intent-to-add
-                entry["intent-to-add"] = bool(entry["extra-flags"] & (0b00100000 << 8))
-                # 13-bits unused
-                # used = entry["extra-flags"] & (0b11100000 << 8)
-                # check(not used, "Expected unused bits in extra-flags")
-                entrylen += 2
+                if namelen < 0xFFF:
+                    entry["name"] = f.read(namelen).decode("utf-8", "replace")
+                    entrylen += namelen
+                else:
+                    # Do it the hard way
+                    name = []
+                    while True:
+                        byte = f.read(1)
+                        if byte == b'\x00':  # 在Python3中，字节比较需要使用字节字面量
+                            break
+                        name.append(byte)
+                    entry["name"] = b"".join(name).decode("utf-8", "replace")
+                    entrylen += len(name) + 1  # 修正长度计算
 
-            if namelen < 0xFFF:
-                entry["name"] = f.read(namelen).decode("utf-8", "replace")
-                entrylen += namelen
-            else:
-                # Do it the hard way
-                name = []
-                while True:
-                    byte = f.read(1)
-                    if byte == b"\x00":  # 使用bytes类型进行比较
-                        break
-                    name.append(byte)
-                entry["name"] = b"".join(name).decode("utf-8", "replace")
-                entrylen += 1
+                # 计算填充长度
+                padlen = (8 - (entrylen % 8)) or 8
+                nuls = f.read(padlen)
+                # 在Python3中，需要将字节与字节进行比较
+                check(all(b == 0 for b in nuls), "padding contained non-NUL")
 
-            padlen = (8 - (entrylen % 8)) or 8
-            nuls = f.read(padlen)
-            check(set(nuls) == set(['\x00']), "padding contained non-NUL")
-
-            yield entry
-
-        f.close()
+                yield entry
